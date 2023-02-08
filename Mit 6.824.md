@@ -960,6 +960,8 @@ Goroutine 27 (running) created at:
 
 currentTerm、voteFor、log[]三个state。因此只要当raft节点的这三个状态发生改变时，就将他们的状态存储到磁盘上。
 
+用gob的encode库来序列和反序列化文件。
+
 ```go
 
 func (rf *Raft) persist() {
@@ -976,6 +978,7 @@ func (rf *Raft) persist() {
 func (rf *Raft) persistdate() []byte{
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+    //序列化
 	e.Encode(rf.term)
 	e.Encode(rf.Logs)
 	e.Encode(rf.lastIncludeIndex)
@@ -1117,10 +1120,10 @@ lastidx:快照包含的最大下标（已经压入快照的下标）
 
 #### 更新快照
 
-该服务表示，它已经创建了一个快照，其中包含所有信息，包括索引。这意味着服务不再需要通过（包括）该索引进行日志记录。raft现在应该尽可能地修剪快照。
+该服务表示，它已经创建了一个快照，其中包含所有信息，包括索引。这意味着服务不再需要通过（包括）该索引进行日志记录。raft现在应该尽可能地修剪快照。快照只能包含已提交的内容。
 
 ```go
-//follower主动更新快照。snapshot:传来的快照日志，index：快照日志最后的index
+//follower主动更新快照。snapshot:传来的快照日志，index：快照日志包含的最后的日志下标。
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	if rf.killed() {
@@ -1130,7 +1133,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// 如果下标大于自身的提交，说明没被提交不能安装快照，如果自身快照点大于index说明不需要安装
-	//fmt.Println("[Snapshot] commintIndex", rf.commitIndex)
 	if rf.lastIncludeIndex >= index || index > rf.Commitindex {
 		return
 	}
@@ -1165,7 +1167,114 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 ```
 
+**快照下标和原本下标**
 
+**因为存储了快照之后，会将lastindex之前的日志都抛弃（存到磁盘上）**
+
+```go
+快照包含的最后的日志的任期和下标
+rf.lastIncludeIndex
+rf.lastIncludeIndex
+当前index在log中的真实位置其实就是cur-last
+当index等于lastindex时，就不能再从log中找数据了，因为log直接空了，所以要保存lastindex和lastterm
+```
+
+
+
+```c++
+
+func (rf* Raft) restoreindex(curIndex int) int {
+	return curIndex-rf.lastIncludeIndex
+}
+// 通过快照偏移还原真实日志条目
+func (rf *Raft) restoreLog(curIndex int) Entry {
+	return rf.Logs[curIndex-rf.lastIncludeIndex]
+}
+
+// 通过快照偏移还原真实日志任期
+func (rf *Raft) restoreLogTerm(curIndex int) int {
+	// 如果当前index与快照一致/日志为空，直接返回快照/快照初始化信息，否则根据快照计算
+	if curIndex==rf.lastIncludeIndex {
+		return rf.lastIncludeTerm
+	}
+	//fmt.Printf("[GET] curIndex:%v,rf.lastIncludeIndex:%v\n", curIndex, rf.lastIncludeIndex)
+	return rf.Logs[curIndex-rf.lastIncludeIndex].Term
+}
+
+// 获取最后的日志下标
+func (rf *Raft) getLastIndex() int {
+	return len(rf.Logs) -1 + rf.lastIncludeIndex
+}
+
+// 获取最后的任期
+func (rf *Raft) getLastTerm() int {
+	// 因为初始有填充一个，否则最直接len == 0
+	if len(rf.Logs)-1 == 0 {
+		return rf.lastIncludeTerm
+	} else {
+		return rf.Logs[len(rf.Logs)-1].Term
+	}
+}
+
+// 通过快照偏移还原server的PrevLogInfo
+func (rf *Raft) getPrevLogInfo(server int) (int, int) {
+	newEntryBeginIndex := Max(rf.NextIndex[server] - 1,0)
+    //如果下标超了，相等。
+	lastIndex := rf.getLastIndex()
+	if newEntryBeginIndex >= lastIndex+1 {
+		newEntryBeginIndex = lastIndex
+	}
+	return newEntryBeginIndex, rf.restoreLogTerm(newEntryBeginIndex)
+}
+
+```
+
+当要发送给follower的日志在快照中时，直接发送快照。
+
+```go
+//由领导者调用，向跟随者发送快照的分块。领导者总是按顺序发送分块。
+func (rf *Raft) leaderSendSnapShot(server int) {
+
+	rf.mu.Lock()
+
+	args := InstallSnapshotArgs{
+		rf.term,
+		rf.me,
+		rf.lastIncludeIndex,
+		rf.lastIncludeTerm,
+		rf.persister.ReadSnapshot(),
+	}
+	reply := InstallSnapshotReply{}
+
+	rf.mu.Unlock()
+
+	ok := rf.peers[server].Call("Raft.InstallSnapShot", args, reply)
+
+	if ok == true {
+		rf.mu.Lock()
+		if rf.statue != leader || rf.term != args.Term {
+			rf.mu.Unlock()
+			return
+		}
+
+
+		if reply.Term > rf.term {
+			rf.statue = follower
+			rf.Updateterm(reply.Term)
+			//rf.persist()
+			rf.Upelection()
+			rf.mu.Unlock()
+			return
+		}
+		
+		rf.matchIndex[server] = args.LastIncludeIndex
+		rf.NextIndex[server] = args.LastIncludeIndex + 1
+
+		rf.mu.Unlock()
+		return
+	}
+}
+```
 
 
 
@@ -1252,11 +1361,11 @@ type ChanResult struct {
 
 lab4 的内容是要在 lab2 的基础上实现一个 multi-raft 的 KV 存储服务，同时也要支持切片在不同 raft 组上的动态迁移而不违背线性一致性，不过其不需要实现集群的动态伸缩。总体来看，lab4 是一个相对贴近生产场景的 lab。
 
-构建一个密钥/值存储系统，它将密钥“分片”或分区到一组副本组上。分片是键/值对的子集；例如，所有以“a”开头的键可能都是一个分片，而所有以“b”开头的按键可能都是另一个，等等。分片的原因是性能。每个复制组只处理几个碎片的put和get，并且组并行操作；因此，总系统吞吐量（每单位时间的投入和获得）与组的数量成比例地增加。
+构建一个密钥/值存储系统，它将密钥“分片”或分区到一组副本组上。分片是键/值对的子集；例如，所有以“a”开头的键可能都是一个分片，而所有以“b”开头的按键可能都是另一个，等等。分片的原因是性能。每个复制组只处理几个shard的put和get，并且组并行操作；因此，总系统吞吐量（每单位时间的投入和获得）与组的数量成比例地增加。
 
-分片密钥/值存储将有两个主要组件。首先是一组副本组。每个副本组负责碎片的子集。副本由几个服务器组成，这些服务器使用Raft来复制组的碎片。第二个组件是“碎片控制器”。碎片控制器决定哪个副本组应该为每个碎片服务；该信息称为配置。配置随时间变化。客户端咨询碎片控制器以查找密钥的副本组，副本组咨询控制器以查找要服务的碎片。整个系统只有一个碎片控制器，使用Raft实现为容错服务。
+分片密钥/值存储将有两个主要组件。首先是一组副本组。每个副本组负责shard的子集。副本由几个服务器组成，这些服务器使用Raft来复制组的shard。第二个组件是“shard控制器”。shard控制器决定哪个副本组应该为每个shard服务；该信息称为配置。配置随时间变化。客户端咨询shard控制器以查找密钥的副本组，副本组咨询控制器以查找要服务的shard。整个系统只有一个shard控制器，使用Raft实现为容错服务。
 
-分片存储系统必须能够在副本组之间切换分片。一个原因是，某些组可能比其他组负载更大，因此需要移动碎片以平衡负载。另一个原因是副本组可能会加入和离开系统：可能会添加新的副本组以增加容量，或者可能会将现有副本组脱机以进行修复或退役。
+分片存储系统必须能够在副本组之间切换分片。一个原因是，某些组可能比其他组负载更大，因此需要移动shard以平衡负载。另一个原因是副本组可能会加入和离开系统：可能会添加新的副本组以增加容量，或者可能会将现有副本组脱机以进行修复或退役。
 
 
 
@@ -1383,17 +1492,60 @@ shards的下标是分片，一个分片对应一个gid（分组）.多个下标�
 
 通过多次平均地方式来达到这个目的：每次选择一个拥有 shard 数最多的 raft 组和一个拥有 shard 数最少的 raft，将前者管理的一个 shard 分给后者，周而复始，直到它们之前的差值小于等于 1 且 0 raft 组无 shard 为止。
 
-**Join**
+- **Join**
 
 为当前集群添加一组raft服务器。
 
-分片器应该通过创建包含新副本组的新配置来做出反应。新的配置应该在整个组中尽可能均匀地划分碎片，并且应该尽可能少地移动碎片以实现这一目标。如果GID不是当前配置的一部分，分片器应该允许重复使用GID（即，应该允许GID加入，然后离开，然后再次加入）
+分片器应该通过创建包含新副本组的新配置来做出反应。新的配置应该在整个组中尽可能均匀地划分shard，并且应该尽可能少地移动shard以实现这一目标。如果GID不是当前配置的一部分，分片器应该允许重复使用GID（即，应该允许GID加入，然后离开，然后再次加入）
 
 **注意：**
 
 这些命令会在一个 raft 组内的所有节点上执行，因此需要保证同一个命令在不同节点上计算出来的新配置一致，而 go 中 map 的遍历是不确定性的，因此需要稍微注意一下确保相同地命令在不同地节点上能够产生相同的配置。
 
 ```go
+//加入一个新的组 ，创建一个最新的配置，加入新的组后需要重新进行**负载均衡**。
+func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
+	// Your code here.
+	_, ifLeader := sc.rf.GetState()
+	if !ifLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 封装Op传到下层start
+	op := Op{
+		Optype: Join,
+		Servers: args.Servers,
+		CommandId: args.CommandId,
+		ClientId: args.ClientId,
+	}
+	//将操作写入日志
+	lastIndex, _, _ := sc.rf.Start(op)
+	//当这个操作被集群提交时，在调用对应的函数处理操作。
+	ch := sc.GetNotifyChan(lastIndex)
+	defer func() {
+		sc.mu.Lock()
+		delete(sc.notifyChans, lastIndex)
+		sc.mu.Unlock()
+	}()
+
+	// 设置超时ticker
+	timer := time.NewTicker(100 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case reply := <-ch:
+
+		if op.ClientId != reply.Op.ClientId || op.CommandId != reply.Op.CommandId {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+			return
+		}
+	case <-timer.C:
+		reply.Err = ErrTimeout
+	}
+}
 func (sc* ShardCtrler) JoinHandler(joins map[int][]string ) Config{
 	// 取出最后一个config将分组加进去
 	lastConfig := sc.configs[len(sc.configs)-1]
@@ -1436,7 +1588,549 @@ func (sc* ShardCtrler) JoinHandler(joins map[int][]string ) Config{
 
 
 
+- leave
+
+```go
+
+//删除一组raft组。如果 Leave 后集群中无 raft 组，则将分片所属 raft 组都置为无效的 0；否则将删除 raft 组的分片均匀地分配给仍然存在的 raft 组。
+func (sc* ShardCtrler) LeaveHandler(servers []int) *Config{
+	lastConfig := sc.configs[len(sc.configs)-1]
+	newGroups := make(map[int][]string)
+
+	for gid, serverList := range lastConfig.Groups {
+		newGroups[gid] = serverList
+	}
+	//stog[i]:这个分组要处理的分片。
+	stog := make(map[int][]int)
+	for index,gid := range lastConfig.Shards {
+		stog[gid]=append(stog[gid],index)
+	}
+	//要处理的分片
+	var LeaveShards []int
+	for _,gid := range servers{
+		if _,ok := newGroups[gid];ok{
+			delete(newGroups,gid)
+		}
+		//如果这个gid有处理的分片
+		if shards, ok := stog[gid]; ok {
+			LeaveShards = append(LeaveShards, shards...)
+			delete(stog, gid)
+		}
+	}
+	var newShards [NShards]int
+	//将分片分给最轻松的分组。
+	if len(lastConfig.Groups) != 0 {
+		for _, shard := range LeaveShards {
+			target := sc.Minserver(stog)
+			stog[target] = append(stog[target], shard)
+		}
+		for gid, shards := range stog {
+			for _, shard := range shards {
+				newShards[shard] = gid
+			}
+		}
+	}
+	return &Config{
+		Num:    len(sc.configs),
+		Shards: newShards,
+		Groups: newGroups,
+	}
+}
+```
+
 
 
 ### lab4B：高可用性的数据库
+
+shard化存储系统必须能够在副本组之间移动shard。一个原因是某些组可能比其他组负载更大，因此需要移动shard来平衡负载。另一个原因是副本组可能会加入或离开系统：可能会添加新的副本组以增加容量，或者可能会使现有副本组脱机以进行修复或退役。
+
+
+
+这个实验室的主要挑战是处理重新配置——改变shard分配给组的方式。在单个副本组中，所有组成员必须就何时发生与客户机放置/附加/获取请求相关的重新配置达成一致。**例如，Put可能在重新配置的同时到达，这会导致副本组停止对持有Put密钥的shard负责。组中的所有复制副本必须就Put是在重新配置之前还是之后发生达成一致。**如果在之前，Put应该生效，shard的新所有者将看到它的效果；如果之后，put操作没有起效，客户必须在新所有者处重新尝试。推荐的方法是让每个副本组使用Raft不仅记录Put、Appends和Get的序列，还记录重新配置的序列。您需要确保在任何时候最多有一个副本组为每个shard提供请求。
+
+
+
+重新配置还需要副本组之间的交互。例如，在配置10中，组G1可以负责碎片S1。在配置11中，组G2可以负责碎片S1。在从10到11的重新配置期间，G1和G2必须使用RPC将碎片S1（键/值对）的内容从G1移动到G2。
+
+
+
+只有RPC可以用于客户端和服务器之间的交互。例如，不允许服务器的不同实例共享Go变量或文件。
+
+
+
+这个实验室使用“配置”来指代将shard分配给副本组。这与Raft集群成员身份更改不同。您不必实现Raft集群成员身份更改。
+
+multi-raft就是用多组raft组来搭建分布式存储系统，lab3中是当raft组的，lab4相当于在各个lab3的单raft组中协调。
+
+- 如何将数据分片到各个raft组上。
+
+- 如何处理读写跨raft组的数据，您需要为跨shard移动的客户端请求提供最多一次语义（重复检测）。
+- 客户端操作和负载均衡操作同时到达，该如何处理。
+- CONFIG变化后，如何转移SHARD（如果一个REPLICA GROUP A得到一个SHARD 1，对应B 失去一个SHARD 1）
+
+- 想想shardkv客户端和服务器应该如何处理ErrWrongGroup。如果客户端收到ErrWrongGroup，是否应更改序列号？如果在执行Get/Put请求时返回ErrWrongGroup，服务器是否应该更新客户端状态？
+
+- 在服务器移动到新配置后，它可以继续存储不再拥有的shard（尽管这在真实系统中是令人遗憾的）。这可能有助于简化服务器实现。
+
+- 当组G1在配置更改期间需要G2的shard时，G2在处理日志条目的过程中的什么时候将shard发送给G1是否重要？
+
+- 如果您的一个RPC处理程序在其回复中包含一个映射（例如，键/值映射），该映射是服务器状态的一部分，那么您可能会由于竞争而出现错误。RPC系统必须读取映射才能将其发送给调用者，但它没有持有覆盖映射的锁。但是，当RPC系统读取同一映射时，服务器可能会继续修改该映射。解决方案是RPC处理程序在回复中包含该映射的副本。
+
+- 如果您在Raft日志条目中放置了一个映射或切片，并且您的key/value服务器随后在applyCh上看到了该条目，并在key/value服务器的状态中保存了对映射/切片的引用，那么您可能会发生竞争。制作映射/切片的副本，并将副本存储在键/值服务器的状态中。竞争是你的键/值服务器修改映射/切片和Raft在持久化日志的同时读取它。
+
+- 在配置更改期间，一对组可能需要在它们之间的两个方向上移动shard。如果您看到死锁，这可能是一个原因。
+
+一开始系统会创建一个 shardctrler 组来负责配置更新，分片分配等任务，接着系统会创建多个 raft 组来承载所有分片的读写任务。此外，raft 组增删，节点宕机，节点重启，网络分区等各种情况都可能会出现。
+
+对于集群内部，我们需要保证所有分片能够较为均匀的分配在所有 raft 组上，还需要能够支持动态迁移和容错。
+
+对于集群外部，我们需要向用户保证整个集群表现的像一个永远不会挂的单节点 KV 服务一样，即具有线性一致性。
+
+lab4b 的基本测试要求了上述属性，challenge1 要求及时清理不再属于本分片的数据，challenge2 不仅要求分片迁移时不影响未迁移分片的读写服务，还要求不同地分片数据能够独立迁移，即如果一个配置导致当前 raft 组需要向其他两个 raft 组拉取数据时，即使一个被拉取数据的 raft 组全挂了，另一个正常的被拉取的raft组也能正常提供服务 
+
+(假设某个复制组G3在转换到C时需要G1的碎片S1和G2的碎片S2。我们确实希望G3在收到必要的状态后立即开始为碎片提供服务，即使它仍在等待其他碎片。例如，如果G1停机，G3一旦从G2接收到适当的数据，就应该开始为S2的请求提供服务，尽管到C的转换尚未完成。) 。
+
+#### Client端
+
+每个client有一个独一的ID（用snow算法生成），每个任务也有一个taskId，服务器通过clientId和taskId来避免任务重复执行
+
+```go
+//这个操作是否重复，因为commandid从客户端还是服务端都能保证它是递增的，所以只要和最后的commid相比就好了。
+func (kv *KVServer) Isrepeat(Clinet int64,commid int)  bool{
+
+	if value, ok := kv.lastClientOperation[Clinet]; ok {
+		if value.SequenceNum <= commid {
+			return true
+		}
+	}
+	return false
+}
+```
+
+- 缓存每个分片的 leader。
+- rpc 请求成功且服务端返回 OK 或 ErrNoKey，则可直接返回。
+- rpc 请求成功且**服务端返回 ErrWrongGroup，则需要重新获取最新 config 并再次发送请求。**
+- rpc 请求失败一次，需要继续遍历该 raft 组的其他节点。
+- rpc 请求失败副本数次，此时需要重新获取最新 config 并再次发送请求。
+
+```go
+func (ck *Clerk) Get(key string) string {
+	ck.CommandId++
+	args := GetArgs{
+		ClientId: ck.ClientId,
+		CommandId: ck.CommandId,
+		Key: key,
+	}
+
+	for {
+		//根据分片找到对应的的raft组
+		shard := key2shard(key)
+		gid := ck.config.Shards[shard]
+		//尝试对这个raft组找到它的leader
+		if servers, ok := ck.config.Groups[gid]; ok {
+			// try each server for the shard.
+				srv := ck.make_end(servers[ck.G2L[gid]])
+				var reply GetReply
+				ok := srv.Call("ShardKV.Get", &args, &reply)
+            	if !ok{
+                	break;
+            	}
+				if reply.Err == OK || reply.Err == ErrNoKey {
+					return reply.Value
+				}
+                //如果找到错误分组，推出循环，去找最新的配置。
+				if reply.Err == ErrWrongGroup {
+					break
+				}
+            	if reply.Err==ErrWrongLeader{
+                	ck.G2L[gid]=reply.leaderId
+            	}
+                //如果分组正在迁徙，等待一会重试
+				// ... not ok, or ErrWrongLeader
+
+		}
+		time.Sleep(100 * time.Millisecond)
+		// ask controler for the latest configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+
+	return ""
+}
+
+```
+
+
+
+#### Server端
+
+说到底，分布式的最终目的还是实现线性，就像jvm的happen before一样，不论处理器，编译器怎么优化，怎么改变运行顺序，最终的结果就与串行运行的结果一致。
+
+- 如何保证各个集群配置的线性。
+
+  配置的更新只能一步一步递增，且必须等到数据迁徙完成才能更新配置信息。如果当前节点获取到的配置信息比其他集群新，必须阻塞，等到所有集群的配置信息一致。
+
+- 如何保证数据迁徙的线性。
+
+  数据迁徙的方向只能是单向，要么从需要方流向多余方，要么从多余方流向需要方。
+
+  - 为了保证在数据迁徙时尽可能的提供服务，数据迁徙的粒度就必须以分片为单位。所以各个分片的配置序列可能会在一段时间内不一致，但是配置序列的不一致又会阻塞配置的更新，所以最后集群各个分片的状态一定会达成一致。
+
+- 如何保证集群内部数据的线性。
+
+  不论是集群配置还是数据迁徙，都要通过raft组写日志来达成本集群的共识。
+
+<img src="Mit 6.824/image-20230207154245836.png" alt="image-20230207154245836" style="zoom:80%;" />
+
+
+
+服务端数据结构
+
+我们的kv系统要求配置的更新和分片的状态变化彼此独立，所以很显然地一个答案就是我们不仅不能在配置更新时同步阻塞的去拉取数据，也不能异步的去拉取所有数据并当做一条 raft 日志提交，而是应该将不同 raft 组所属的分片数据独立起来，分别提交多条 raft 日志来维护状态。因此，ShardKV 应该对每个分片额外维护其它的一些状态变量。
+
+处理客户端或其他集群的操作时，先判断配置信息是否一致，如果一致，继续判断该分片的配置信息是否一致，如果一致，返回结果。
+
+```go
+//读写的粒度是以分片为单位，分片可用的时机就是分片的配置序列和节点的配置序列一致。
+type MemoryKV struct {
+	Shardmap []Shard
+}
+type Shard struct {
+	KvMap     map[string]string
+	ConfigNum int 
+}
+
+func NewMemoryKV(NShards int) *MemoryKV {
+
+	return &MemoryKV{ make([]Shard, NShards)}
+}
+```
+
+**如果leader在更新配置的过程挂掉了，如何保证其余节点不会重复数据迁徙**
+
+配置信息都保存了，分片信息还未保存。这时新leader的配置协程会检查是否有分片未处理，如果有，再去处理数据迁徙。
+
+配置信息保存，一部分片信息保存了，新leader的配置协程同样会处理剩余未能达成一致性的分片信息。
+
+最后更新分片时，再次检查分片的日志序号，防止重复处理。
+
+```go
+//不断的判断更新配置---有新配置---raft集群达成共识---去拉取相应的
+func (kv*ShardKV) UpdateCfg() {
+	for kv.Killed()==false {
+		time.Sleep(Upcfgtime)
+		//只有leader能查看配置，因为只有leader能将新配置发给其他节点。
+		if kv.rf.statue!=leader || !kv.CheckFinish() {
+			continue
+		}
+
+		currentcfg,flag := kv.Checkcfg(kv.currentConfig.num+1)
+		if !flag {
+			continue
+		}
+		kv.lastConfig=kv.currentConfig
+		kv.currentConfig=currentcfg
+
+        
+        //如果配置和分片有一个不一致，就不能再继续更新配置，必须阻塞直到配置和分片趋于一致。
+		//配置有更新。先在raft集群中达成共识
+		kv.RaftUpcfg()
+		//然后再做数据迁徙，以分片为粒度。
+		kv.CheckFinish()
+
+	}
+
+}
+```
+
+节点再查询新配置时，一定要先完成之前的配置更新。
+
+```go
+//配置是否更新完,是否发送完，是否接收完。底层是否已经更新了配置。
+func (kv* ShardKV)CheckFinish()bool  {
+	//如果当前的Config
+	var flag bool
+	for shard, gid := range kv.lastConfig.Shards {
+
+		// 判断切片是否都发送了
+		if gid == kv.gid && kv.Config.Shards[shard] != kv.gid {
+            //如果还没发送，发送数据。
+			if  kv.shardsPersist[shard].ConfigNum < kv.Config.Num{
+
+				sendDate := kv.cloneShard(kv.Config.Num, kv.shardsPersist[shardId].KvMap)
+                //bug：：这里注意要将我们保存的各个客户的最后Command也一并发送过去，因为对上层而言数据迁徙是透明的，所以客户的最后command应该是集群间共享的！！
+				args := SendShardArg{
+					LastAppliedRequestId: kv.lastCommand,
+					ShardId:              shardId,
+					Shard:                sendDate,
+					ClientId:             int64(gid),
+                    //如果接收方的任期序列比我们还低它会返回false，我们不断尝试向他发送直到它配置追上来。
+					RequestId:            kv.Config.Num,
+				}
+				kv.SendShard(kv.Config.Shards[shard],args)
+				flag = false
+			}
+		}
+	}
+
+	if !flag {
+		time.Sleep(Upcfgtime)
+		return false
+	}
+	for shard, gid := range kv.lastConfig.Shards {
+
+		// 判断切片是否都收到了
+		if gid != kv.gid && kv.Config.Shards[shard] == kv.gid  {
+			if  kv.shardsPersist[shard].ConfigNum < kv.Config.Num{
+				return false
+			}
+		}
+	}
+
+	return true
+
+}
+```
+
+向集群发送分片
+
+```go
+//向这个集群发送分片,如果该集群的配置信息比我们落后怎么办？那么该集群会返回错误，因为他
+func (kv *ShardKV)SendShard(gid int,args * SendShardArg)  {
+
+
+	// shardId -> gid -> server names
+	serversList := kv.Config.Groups[kv.Config.Shards[gid]]
+	servers := make([]*labrpc.ClientEnd, len(serversList))
+	for i, name := range serversList {
+		servers[i] = kv.make_end(name)
+	}
+	go func(servers []*labrpc.ClientEnd, args *SendShardArg) {
+
+		index := 0
+		start := time.Now()
+		for {
+			var reply AddShardReply
+			// 对自己的共识组内进行add
+			ok := servers[index].Call("ShardKV.AddShard", args, &reply)
+
+			// 如果给予切片成,抛弃自己的切片
+			if ok && reply.Err == OK || time.Now().Sub(start) >= 2*time.Second {
+
+				// 如果成功发送，更新集群删除该分片。
+				//如果发送成功，而leader挂掉了，怎么处理。如果leader此时挂掉了，其他节点并未删除分片，所以会再次发送分片，
+				//如果接收方收到了已经存在的分片，返回true。
+				kv.mu.Lock()
+				command := Op{
+					Optype:   DeleteShard,
+					ClientId: int64(kv.gid),
+					CommandId:    kv.Config.Num,
+					ShardId:  args.ShardId,
+				}
+				kv.mu.Unlock()
+				kv.Command(command, RemoveShardsTimeout)
+				break
+			}
+			index = (index + 1) % len(servers)
+			if index == 0 {
+				time.Sleep(UpConfigLoopInterval)
+			}
+		}
+	}(servers, args)
+}
+```
+
+
+
+```go
+
+func (kv *ShardKV) AddShard(args *SendShardArg, reply *AddShardReply) {
+	command := Op{
+		OpType:   AddShardType,
+		ClientId: args.ClientId,
+		SeqId:    args.RequestId,
+		ShardId:  args.ShardId,
+		Shard:    args.Shard,
+		SeqMap:   args.LastAppliedRequestId,
+	}
+	reply.Err = kv.Command(command, AddShardsTimeout)
+	return
+}
+//接收方
+func (kv *ShardKV) addShardHandler(op Op) {
+    //如果我已经接收过该分片了，或者你的配置已经过时了，返回true。
+	if op.Shard.ConfigNum <= kv.Db[op.ShardId].ConfigNum || op.Shard.ConfigNum < kv.Config.Num {
+		return true
+	}
+
+	kv.shardsPersist[op.ShardId] = kv.cloneShard(op.Shard.ConfigNum, op.Shard.KvMap)
+	//更新这个分片客户端的信息。
+	for clientId, seqId := range op.SeqMap {
+		if r, ok := kv.SeqMap[clientId]; !ok || r < seqId {
+			kv.SeqMap[clientId] = seqId
+		}
+	}
+}
+```
+
+
+
+
+
+服务端不断先在raft集群达成共识，再调用回调函数处理。
+
+```go
+func (kv *ShardKV)Command(command Op,tiemout time.Millisecond) Err {
+	_, ifLeader := kv.rf.GetState()
+	if !ifLeader {
+		return ErrWrongLeaderr
+	}
+
+	//将操作写入日志
+	lastIndex, _, _ := kv.rf.Start(command)
+	//当这个操作被集群提交时，在调用对应的函数处理操作。
+	ch := kv.GetNotifyChan(lastIndex)
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, lastIndex)
+		kv.mu.Unlock()
+	}()
+
+	// 设置超时ticker
+	timer := time.NewTicker(100 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case reply := <-ch:
+		//可能在处理的过程中leader挂掉了，该日志并未提交。另一个leader上位覆盖掉了该日志，虽然他们的日志下标相同，但是日志代表的内容不同。
+		if command.ClientId != reply.Op.ClientId || command.CommandId != reply.Op.CommandId {
+			return  ErrWrongLeader
+		} else {
+			return reply.Err
+		}
+	case <-timer.C:
+		return ErrTimeout
+	}
+}
+```
+
+
+
+
+
+```go
+//下层的raft层提交数据上来。
+func (kv* ShardKV) applier()  {
+	for kv.killed() == false {
+		select {
+		case message := <-kv.applyCh:
+
+			if message.CommandValid {
+				kv.mu.Lock()
+				if message.CommandIndex <= kv.lastApplied {
+					kv.mu.Unlock()
+					continue
+				}
+				kv.lastApplied = message.CommandIndex
+
+				var response CommandReply
+				command := message.Command.(Op)
+				switch command.Optype {
+				case Upcfg:
+					response = kv.UpdateCfg(&command)
+				case DeleteShard:
+					response = kv.DeleteShard(&command)
+				case AddShard:
+					response=kv.AddShard(&command)
+				case Get:
+					response = kv.GetValue(&command)
+				case Put:
+					response = kv.PutValue(&command)
+				case Append:
+					response = kv.AppendValue(&command)
+				}
+
+				// 如果需要snapshot，且超出其stateSize,告诉raft层开始压缩。
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+					snapshot := kv.PersistSnapShot()
+					kv.rf.Snapshot(message.CommandIndex, snapshot)
+				}
+				kv.mu.Unlock()
+				//如果发来的是快照。
+			} else if message.SnapshotValid {
+				kv.mu.Lock()
+				if kv.rf.CondInstallSnapshot(message.SnapshotTerm, message.SnapshotIndex, message.Snapshot) {
+					kv.DecodeSnapShot(message.Snapshot)
+					kv.lastApplied = message.SnapshotIndex
+				}
+				kv.mu.Unlock()
+			} else {
+				panic(fmt.Sprintf("unexpected Message %v", message))
+			}
+		}
+	}
+}
+```
+
+可以看到，如果当前 raft 组在当前 config 下负责管理此分片，则只要分片的配置序列号相同，本 raft 组就可以为该分片提供读写服务，否则返回 ErrWrongGroup 让客户端重新 fecth 最新的 config 并重试即可。
+
+读写操作的基本逻辑和 lab3 一致，可以在向 raft 提交前和 apply 时都检测一遍是否重复以保证线性化语义。
+
+```c++
+
+func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
+	shardId := key2shard(args.Key)
+	kv.mu.Lock()
+	if kv.Config.Shards[shardId] != kv.gid {
+		reply.Err = ErrWrongGroup
+	} else if kv.Db.SGetShard(shardId).KvMap == nil {
+		reply.Err = ShardNotArrived
+	}
+	kv.mu.Unlock()
+	if reply.Err == ErrWrongGroup || reply.Err == ShardNotArrived {
+		return
+	}
+	command := Op{
+		Optype:   Get,
+		ClientId: args.ClientId,
+		CommandId:args.CommandId,
+		Key:      args.Key,
+	}
+	commandreply := kv.Command(command, GetTimeout)
+	if err != OK {
+		reply.Err = commandreply.Err
+		return
+	}
+	kv.mu.Lock()
+	
+    reply.Err=commandreply.value
+	kv.mu.Unlock()
+	return
+
+}
+
+func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+	shardId := key2shard(args.Key)
+	kv.mu.Lock()
+	if kv.Config.Shards[shardId] != kv.gid {
+		reply.Err = ErrWrongGroup
+	} else if kv.Db.SGetShard(shardId).KvMap == nil {
+		reply.Err = ShardNotArrived
+	}
+	kv.mu.Unlock()
+	if reply.Err == ErrWrongGroup || reply.Err == ShardNotArrived {
+		return
+	}
+	command := Op{
+		Optype:   optype(args.Op),
+		ClientId: args.ClientId,
+		CommandId:args.CommandId,
+		Key:      args.Key,
+		Value:    args.Value,
+	}
+	reply.Err = kv.Command(command, AppOrPutTimeout).Err
+	return
+}
+```
 
